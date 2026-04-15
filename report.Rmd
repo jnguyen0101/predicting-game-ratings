@@ -1,0 +1,168 @@
+---
+title: "Predicting Game Ratings on Steam"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+## Question
+
+Can the rating of a game be predicted based on its metadata (such as genres, price, and categories)? I'll be predicting the variable `pct_pos_total`, which takes on values from 0 to 100 and represents the percentage of positive reviews that the game has. Answering this question can be useful for game developers to estimate how well their game might perform on Steam. If metadata can predict future user ratings, then developers can use higher-performing metadata if they want their game to have higher positive ratings.
+
+## Data and Setup
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(stringr)
+library(textrecipes)
+library(ranger)
+set.seed(123)
+
+## Add your code for reading in the data here
+games <- read_csv("games_march2025_cleaned.csv")
+
+## Removes games with invalid/no reviews and no playtime
+games <- games |>
+  filter((positive + negative) > 0, pct_pos_total > 0, peak_ccu > 0) |>
+  
+  ## Remove brackets from genres and categories columns
+  mutate(categories = str_remove_all(categories, "[\\[\\]']"),
+         genres = str_remove_all(genres, "[\\[\\]']")) |>
+  
+  ## Keep only relevant variables
+  select(name, required_age, price, dlc_count, achievements, recommendations, categories, genres, peak_ccu, positive, negative, estimated_owners, pct_pos_total)
+
+```
+
+## Base Prediction Model
+
+```{r}
+## Splits the dataset into training and testing datasets
+games_split <- initial_split(games, prop = 0.75, strata = pct_pos_total)
+games_train <- training(games_split)
+games_test  <- testing(games_split)
+
+## Define recipe and select variables (price, genres, categories, peak concurrent connected users)
+game_rec <- games_train |>
+  recipe(pct_pos_total ~ price + genres + categories + peak_ccu) |>
+  step_normalize(price, peak_ccu) |>
+  step_tokenize(genres, categories) |>
+  step_tokenfilter(genres, max_tokens = 8) |> ## Keep only the most popular genres
+  step_tokenfilter(categories, max_tokens = 4) |> ## Keep only the most popular categories
+  step_tfidf(genres, categories)
+
+model <- linear_reg() |>
+  set_engine("lm") |>
+  set_mode("regression")
+
+wf <- workflow() |>
+  add_recipe(game_rec) |>
+  add_model(model)
+
+## Use 10-fold cross-validation to estimate the RMSE
+game_folds <- vfold_cv(games_train, v = 10)
+model_fit <- fit_resamples(wf, resamples = game_folds)
+model_fit |>
+  collect_metrics()
+
+```
+
+Price + genres + categories + peak_ccu seems to produce the best performing model on the training data with an RMSE of about 13.2949 and an RSQ of about 0.07500.
+
+## Alternate Prediction Model
+
+```{r}
+## Identifies the tuning parameters for random forest
+rf_model <- rand_forest(
+  mtry = tune(),
+  trees = 500,
+  min_n = tune()
+) |>
+  set_engine("ranger") |> 
+  set_mode("regression")
+
+rf_wf <- workflow() |>
+  add_recipe(game_rec) |>
+  add_model(rf_model)
+
+## Tune model using grid
+rf_grid <- grid_regular(
+  mtry(range = c(2, 8)), 
+  min_n(range = c(5, 20)),
+  levels = 3
+)
+
+rf_res <- tune_grid(
+  rf_wf,
+  resamples = game_folds,
+  grid = rf_grid
+)
+
+## Finds the performance metrics of the random forest model
+rf_res |>
+  collect_metrics() |>
+  filter(.metric == "rmse") |>
+  arrange(mean)
+
+rf_res |>
+  collect_metrics() |>
+  filter(.metric == "rsq") |>
+  arrange(desc(mean))
+
+```
+
+The random forest model performed best with an mtry of 2 and a min_n of 20. This combination achieved an RMSE of about 12.8028 and R-squared of about 0.1432, which has better performance than the base linear regression model that had an RMSE of about 13.2949 and R-squared of about 0.07500. The Random Forest likely performed better because it can capture non-linear relationships between variables like price and peak_ccu that the linear regression model might miss.
+
+## Final Model Fit
+
+```{r}
+## Select the best parameters
+best_rf <- rf_res |>
+  select_best(metric = "rmse")
+
+final_wf <- rf_wf |>
+  finalize_workflow(best_rf)
+
+## Fit to the full training set and run on test set
+final_fit <- final_wf |>
+  last_fit(games_split)
+
+final_fit |>
+  collect_metrics()
+
+```
+
+After selecting the best tuning parameters and variables and fitting the model to the testing dataset, the final RMSE was about 12.7777 and the R-squared was about 0.1468 These metrics suggest that while random forest model can explain some of the variance in game ratings, there are many other factors influencing positive review percentage that aren't captured by price or genre alone.
+
+## Model Improvement
+
+```{r}
+## Simulates the hypothetical relationship between publisher popularity and positive review percentage
+games_publisher_sim <- games |>
+  # Creates a simulated popularity score (0 = Unknown, 100 = AAA)
+  mutate(publisher_popularity = runif(n(), 0, 100)) |> 
+  # Simulates that popular publishers have a higher floor for ratings
+  mutate(hypothetical_rating = pct_pos_total + (publisher_popularity * 0.15))
+
+## Plot hypothetical visualization
+games_publisher_sim |>
+  ggplot(aes(x = publisher_popularity, y = hypothetical_rating)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", color = "darkred") +
+  theme_minimal() +
+  labs(
+    title = "Hypothetical Impact of Publisher Popularity on Game Ratings",
+    x = "Publisher Popularity Score (0-100)",
+    y = "Predicted Positive Review Percentage"
+  )
+
+```
+
+I would most like to collect data on game publisher popularity. Currently, the random forest model only sees what the game is and its metadata. A game from a well-known publisher likely receives a higher rating due to established trust and higher production budgets, which are not currently captured by price or genre. This could increase the R-squared by explaining the portion of positive review percentages that are connected to brand reputation rather than just the game's individual attributes.
+
+## Discussion
+
+I thought that handling the data was challenging. Cleaning the dataset was tedious since most of the variables were given in formats that would be hard to work with, so I had to recode them. Finding the combination of variables and tuning parameters to find the best performing model was also pretty challenging. I learned how to implement a full machine learning model using the tidymodels ecosystem. More specifically, I learned about how to tune the model and find the best performing configuration. I was surprised by how low the R-squared values were across both the linear and machine learning models (around 0.12-0.15). I initially expected that if a game had the "right" genres and the "right" price, it would naturally have a high rating. However, the results showed that these variables only explain a small portion of the variance in user reviews.This suggests that on Steam, a game’s success is influenced more by other factors like art style and how well the game was created.
